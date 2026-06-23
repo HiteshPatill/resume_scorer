@@ -2,9 +2,67 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const maxDuration = 60; 
 
-const MAX_RESUME_LENGTH = 50000; 
-const MAX_JOB_DESC_LENGTH = 10000;
+const MAX_RESUME_INPUT_LENGTH = 120000;
+const MAX_JOB_DESC_INPUT_LENGTH = 50000;
+const MAX_RESUME_PROMPT_LENGTH = 30000;
+const MAX_JOB_DESC_PROMPT_LENGTH = 8000;
 const MIN_RESUME_LENGTH = 100;
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash')
+  .split(',')
+  .map((model) => model.trim())
+  .filter(Boolean);
+const GEMINI_RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+async function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function limitTextForPrompt(text: string, maxLength: number) {
+  if (text.length <= maxLength) return text;
+
+  return `${text.slice(0, maxLength)}\n\n[Content shortened for analysis because it was very long.]`;
+}
+
+async function callGemini(apiKey: string, systemPrompt: string) {
+  let lastResponse: Response | null = null;
+  let lastModel = GEMINI_MODELS[0] || 'gemini-2.5-flash';
+
+  for (const model of GEMINI_MODELS) {
+    lastModel = model;
+    const endpoint =
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${apiKey}`;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: systemPrompt }] }],
+          generationConfig: {
+            temperature: 0.1,
+            responseMimeType: 'application/json',
+          },
+        }),
+      });
+
+      lastResponse = response;
+
+      if (response.ok || !GEMINI_RETRY_STATUSES.has(response.status)) {
+        return { response, model };
+      }
+
+      if (attempt < 2) {
+        await delay(750 * (attempt + 1));
+      }
+    }
+  }
+
+  if (lastResponse) {
+    return { response: lastResponse, model: lastModel };
+  }
+
+  throw new Error('Gemini API request failed before receiving a response');
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -15,8 +73,25 @@ export async function POST(request: NextRequest) {
     }
 
     const trimmedResume = resumeText.trim();
-    if (trimmedResume.length < MIN_RESUME_LENGTH || trimmedResume.length > MAX_RESUME_LENGTH) {
+    if (trimmedResume.length < MIN_RESUME_LENGTH) {
       return NextResponse.json({ error: 'Invalid resume length' }, { status: 400 });
+    }
+
+    if (trimmedResume.length > MAX_RESUME_INPUT_LENGTH) {
+      return NextResponse.json(
+        { error: `Resume is too long. Please keep it under ${MAX_RESUME_INPUT_LENGTH.toLocaleString()} characters.` },
+        { status: 400 }
+      );
+    }
+
+    const trimmedJobDescription =
+      typeof jobDescription === 'string' ? jobDescription.trim() : '';
+
+    if (trimmedJobDescription.length > MAX_JOB_DESC_INPUT_LENGTH) {
+      return NextResponse.json(
+        { error: `Job description is too long. Please keep it under ${MAX_JOB_DESC_INPUT_LENGTH.toLocaleString()} characters.` },
+        { status: 400 }
+      );
     }
 
     const apiKey = process.env.GEMINI_API_KEY;
@@ -24,12 +99,18 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'API key not configured' }, { status: 500 });
     }
 
+    const resumeForPrompt = limitTextForPrompt(trimmedResume, MAX_RESUME_PROMPT_LENGTH);
+    const jobDescriptionForPrompt = limitTextForPrompt(
+      trimmedJobDescription,
+      MAX_JOB_DESC_PROMPT_LENGTH
+    );
+
     const systemPrompt = `You are an expert ATS resume analyzer. Analyze the resume provided.
-${jobDescription ? 'Score it against the job description.' : 'Score it as a general ATS analysis.'}
+${jobDescriptionForPrompt ? 'Score it against the job description.' : 'Score it as a general ATS analysis.'}
 
 RESUME:
-${trimmedResume}
-${jobDescription ? `JOB DESCRIPTION:\n${jobDescription}` : ''}
+${resumeForPrompt}
+${jobDescriptionForPrompt ? `JOB DESCRIPTION:\n${jobDescriptionForPrompt}` : ''}
 
 Return ONLY valid JSON matching this exact structure:
 {
@@ -61,24 +142,24 @@ Return ONLY valid JSON matching this exact structure:
 }
 Keep answers minimal and extremely concise.`;
 
-    // 1. Call the stream endpoint instead of generateContent directly
-    const apiResponse = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=' + apiKey,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: systemPrompt }] }],
-          generationConfig: {
-            temperature: 0.1,
-            responseMimeType: 'application/json',
-          },
-        }),
-      }
-    );
+    // 1. Call the stream endpoint and retry short-lived upstream failures.
+    const { response: apiResponse, model } = await callGemini(apiKey, systemPrompt);
 
     if (!apiResponse.ok) {
-      return NextResponse.json({ error: 'Gemini API connection failed' }, { status: apiResponse.status });
+      const errorBody = await apiResponse.text();
+      console.error('Gemini API error:', model, apiResponse.status, errorBody);
+
+      return NextResponse.json(
+        {
+          error:
+            apiResponse.status === 503
+              ? 'ResumeScore is temporarily unavailable because Gemini is under high demand. Please try again in a minute.'
+              : 'Gemini API request failed',
+          status: apiResponse.status,
+          model,
+        },
+        { status: apiResponse.status }
+      );
     }
 
     // 2. Read the stream chunks directly to bypass the 10s idle network cap
